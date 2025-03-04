@@ -18,14 +18,21 @@ CLASS_NAMES = {
     28: "Backpack"
 }
 
-# Track history for bags
-bag_track_history = {}
+# Track history storage
+tracks = {
+    "people": {},
+    "bags": {}
+}
 
 # Thresholds
-STATIONARY_THRESHOLD = 5  # seconds
-MOVEMENT_THRESHOLD = 15   # pixels
+OWNER_DISTANCE_THRESHOLD = 200  # pixels
+ABANDONMENT_TIME_THRESHOLD = 5  # seconds after owner leaves
+STATIONARY_THRESHOLD = 15  # pixels movement
 
-# Video input
+def get_centroid(bbox):
+    x1, y1, x2, y2 = bbox
+    return (int((x1 + x2) // 2), int((y1 + y2) // 2))
+
 cap = cv2.VideoCapture("E:/obs-recording/test-vid.mkv")
 
 while cap.isOpened():
@@ -53,19 +60,24 @@ while cap.isOpened():
     bag_tracks = bag_tracker.update_tracks(bag_detections, frame=frame)
     current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
 
-    # Draw people with blue boxes and IDs
+    # Update people tracks AND DRAW THEM
     for track in person_tracks:
         if not track.is_confirmed():
             continue
-            
-        ltrb = track.to_ltrb()
-        x1, y1, x2, y2 = map(int, ltrb)
         track_id = track.track_id
+        ltrb = track.to_ltrb()
         
-        # Draw box and text
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(frame, f"{CLASS_NAMES[0]}#{track_id}", 
-                   (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        # Store in tracks dict
+        tracks["people"][track_id] = {
+            "bbox": ltrb,
+            "last_seen": current_time
+        }
+
+        # Draw person bounding box (ADDED THIS SECTION)
+        x1, y1, x2, y2 = map(int, ltrb)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue box
+        cv2.putText(frame, f"Human#{track_id}", (x1, y1-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
     # Process bags
     for track in bag_tracks:
@@ -75,73 +87,92 @@ while cap.isOpened():
         track_id = track.track_id
         ltrb = track.to_ltrb()
         x1, y1, x2, y2 = map(int, ltrb)
+        centroid = get_centroid(ltrb)
 
-        # Initialize new bag track
-        if track_id not in bag_track_history:
-            bag_track_history[track_id] = {
-                "class_id": None,
-                "stationary_time": current_time,
-                "last_position": (ltrb[0], ltrb[1])
+        # Initialize bag track
+        if track_id not in tracks["bags"]:
+            # Find closest person as owner
+            min_distance = float('inf')
+            owner_id = None
+            for p_id, p_data in tracks["people"].items():
+                p_centroid = get_centroid(p_data["bbox"])
+                distance = np.linalg.norm(np.array(centroid) - np.array(p_centroid))
+                if distance < min_distance and distance < OWNER_DISTANCE_THRESHOLD:
+                    min_distance = distance
+                    owner_id = p_id
+
+            tracks["bags"][track_id] = {
+                "class_id": next((det[2] for det in bag_detections 
+                                if get_centroid(det[0]) == centroid), 24),
+                "owner": owner_id,
+                "last_owner_seen": current_time if owner_id else None,
+                "stationary_since": current_time,
+                "last_position": centroid
             }
+
+        bag_data = tracks["bags"][track_id]
+        class_name = CLASS_NAMES.get(bag_data["class_id"], "Bag")
+
+        # Update owner status
+        if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
+            owner_centroid = get_centroid(tracks["people"][bag_data["owner"]]["bbox"])
+            distance = np.linalg.norm(np.array(centroid) - np.array(owner_centroid))
             
-            # Find matching detection for class ID
-            max_iou = 0
-            for det in bag_detections:
-                det_bbox = det[0]
-                det_x1, det_y1, det_w, det_h = det_bbox
-                det_x2 = det_x1 + det_w
-                det_y2 = det_y1 + det_h
-                
-                # Calculate IOU
-                intersection = (
-                    max(x1, det_x1),
-                    max(y1, det_y1),
-                    min(x2, det_x2),
-                    min(y2, det_y2)
-                )
-                intersection_area = max(0, intersection[2]-intersection[0]) * max(0, intersection[3]-intersection[1])
-                area_current = (x2-x1) * (y2-y1)
-                area_det = det_w * det_h
-                iou = intersection_area / (area_current + area_det - intersection_area)
-                
-                if iou > max_iou:
-                    max_iou = iou
-                    bag_track_history[track_id]["class_id"] = det[2]
-
-        # Get class name
-        class_id = bag_track_history[track_id]["class_id"]
-        class_name = CLASS_NAMES.get(class_id, "Bag")
-
-        # Movement calculation
-        last_pos = bag_track_history[track_id]["last_position"]
-        current_pos = (ltrb[0], ltrb[1])
-        movement = np.sqrt((current_pos[0]-last_pos[0])**2 + (current_pos[1]-last_pos[1])**2)
-
-        # Default: green box
-        color = (0, 255, 0)
-        text = ""
-
-        # Check abandonment
-        if movement < MOVEMENT_THRESHOLD:
-            stationary_time = current_time - bag_track_history[track_id]["stationary_time"]
-            if stationary_time > STATIONARY_THRESHOLD:
-                color = (0, 0, 255)
-                text = f"ABANDONED! {stationary_time:.1f}s"
+            if distance > OWNER_DISTANCE_THRESHOLD:
+                # Owner moved away
+                bag_data["last_owner_seen"] = current_time
+            else:
+                # Owner still nearby
+                bag_data["last_owner_seen"] = None
         else:
-            bag_track_history[track_id]["stationary_time"] = current_time
+            # Owner left scene
+            bag_data["last_owner_seen"] = bag_data["last_owner_seen"] or current_time
 
-        # Draw bag info
+        # Check abandonment conditions
+        abandonment_time = 0
+        color = (0, 255, 0)  # Green
+        text = ""
+        
+        if bag_data["last_owner_seen"]:
+            abandonment_time = current_time - bag_data["last_owner_seen"]
+            movement = np.linalg.norm(np.array(centroid) - np.array(bag_data["last_position"]))
+            
+            if abandonment_time > ABANDONMENT_TIME_THRESHOLD and movement < STATIONARY_THRESHOLD:
+                color = (0, 0, 255)  # Red
+                text = f"ABANDONED! {abandonment_time:.1f}s"
+
+        # Draw elements
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, f"{class_name}#{track_id}", 
-                   (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.putText(frame, f"{class_name}#{track_id}", (x1, y1-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
+            # Draw owner connection line
+            owner_bbox = tracks["people"][bag_data["owner"]]["bbox"]
+            ox1, oy1, ox2, oy2 = map(int, owner_bbox)
+            
+            # Get integer centroids
+            bag_centroid = (int(centroid[0]), int(centroid[1]))  # Already calculated as integers
+            owner_centroid = get_centroid(owner_bbox)
+            
+            cv2.line(frame, bag_centroid, owner_centroid, (255, 255, 0), 2)
+            cv2.putText(frame, f"Owner#{bag_data['owner']}", 
+                    (ox1, oy1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
         if text:
-            cv2.putText(frame, text, 
-                       (x1, y1-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(frame, text, (x1, y1-40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        bag_track_history[track_id]["last_position"] = current_pos
+        # Update position history
+        bag_data["last_position"] = centroid
 
-    # Display
-    cv2.imshow("Suspicious Bag Detection", frame)
+    # Cleanup old tracks
+    for track_type in ["people", "bags"]:
+        for t_id in list(tracks[track_type].keys()):
+            if current_time - tracks[track_type][t_id].get("last_seen", current_time) > 30:
+                del tracks[track_type][t_id]
+
+    cv2.imshow("Smart Baggage Monitoring", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
