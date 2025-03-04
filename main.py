@@ -4,7 +4,7 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 # Initialize YOLOv8 model
-model = YOLO("yolov8n.pt")
+model = YOLO("yolov8m.pt")
 
 # Initialize DeepSORT trackers
 person_tracker = DeepSort(max_age=30)
@@ -25,15 +25,32 @@ tracks = {
 }
 
 # Thresholds
-OWNER_DISTANCE_THRESHOLD = 200  # pixels
-ABANDONMENT_TIME_THRESHOLD = 3  # seconds after owner leaves
+OWNER_DISTANCE_THRESHOLD = 250  # pixels
+ABANDONMENT_TIME_THRESHOLD = 2  # seconds after owner leaves
 STATIONARY_THRESHOLD = 15  # pixels movement
 
 def get_centroid(bbox):
     x1, y1, x2, y2 = bbox
     return (int((x1 + x2) // 2), int((y1 + y2) // 2))
 
-cap = cv2.VideoCapture("E:/obs-recording/test-vid.mkv")
+
+vids = [
+    # GOODS
+    "E:/obs-recording/vecteezy_people-in-waiting-area-of-terminal-d-in-sheremetyevo_28709722.mov",
+    "E:/obs-recording/vecteezy_traffic-of-passengers-with-luggage-in-amsterdam-airport_28828674.mov",
+    "E:/obs-recording/vecteezy_padova-italy-18-july-2020-people-wait-for-the-train-bench-in_41477169.mp4",
+    "E:/obs-recording/vecteezy_venice-italy-6-january-2023-railway-station-interior_41476584.mov",
+
+    # LEAVING
+    "E:/obs-recording/test-vid.mkv",
+    "E:/obs-recording/test-vid-2.mkv",
+    "E:/obs-recording/test-vid-3.mkv",
+    
+]
+cap = cv2.VideoCapture(vids[5])
+
+cv2.namedWindow("Smart Baggage Monitoring", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Smart Baggage Monitoring", 1280, 720)  # Initial size
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -183,6 +200,9 @@ while cap.isOpened():
         for t_id in list(tracks[track_type].keys()):
             if current_time - tracks[track_type][t_id].get("last_seen", current_time) > 30:
                 del tracks[track_type][t_id]
+
+
+    frame = cv2.resize(frame, None, fx=0.5, fy=0.5)  # Scale down
 
     cv2.imshow("Smart Baggage Monitoring", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
