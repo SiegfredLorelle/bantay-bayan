@@ -26,7 +26,7 @@ tracks = {
 
 # Thresholds
 OWNER_DISTANCE_THRESHOLD = 200  # pixels
-ABANDONMENT_TIME_THRESHOLD = 5  # seconds after owner leaves
+ABANDONMENT_TIME_THRESHOLD = 3  # seconds after owner leaves
 STATIONARY_THRESHOLD = 15  # pixels movement
 
 def get_centroid(bbox):
@@ -91,21 +91,11 @@ while cap.isOpened():
 
         # Initialize bag track
         if track_id not in tracks["bags"]:
-            # Find closest person as owner
-            min_distance = float('inf')
-            owner_id = None
-            for p_id, p_data in tracks["people"].items():
-                p_centroid = get_centroid(p_data["bbox"])
-                distance = np.linalg.norm(np.array(centroid) - np.array(p_centroid))
-                if distance < min_distance and distance < OWNER_DISTANCE_THRESHOLD:
-                    min_distance = distance
-                    owner_id = p_id
-
             tracks["bags"][track_id] = {
                 "class_id": next((det[2] for det in bag_detections 
                                 if get_centroid(det[0]) == centroid), 24),
-                "owner": owner_id,
-                "last_owner_seen": current_time if owner_id else None,
+                "owner": None,
+                "last_owner_seen": None,
                 "stationary_since": current_time,
                 "last_position": centroid
             }
@@ -113,20 +103,42 @@ while cap.isOpened():
         bag_data = tracks["bags"][track_id]
         class_name = CLASS_NAMES.get(bag_data["class_id"], "Bag")
 
-        # Update owner status
+        # Update owner status (NEW LOGIC)
+        current_owner_valid = False
         if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
             owner_centroid = get_centroid(tracks["people"][bag_data["owner"]]["bbox"])
             distance = np.linalg.norm(np.array(centroid) - np.array(owner_centroid))
             
-            if distance > OWNER_DISTANCE_THRESHOLD:
-                # Owner moved away
-                bag_data["last_owner_seen"] = current_time
-            else:
-                # Owner still nearby
+            if distance <= OWNER_DISTANCE_THRESHOLD:
+                current_owner_valid = True
                 bag_data["last_owner_seen"] = None
+            else:
+                # Owner is too far
+                current_owner_valid = False
         else:
-            # Owner left scene
-            bag_data["last_owner_seen"] = bag_data["last_owner_seen"] or current_time
+            current_owner_valid = False
+
+        if not current_owner_valid:
+            # Find new owner
+            min_distance = float('inf')
+            new_owner_id = None
+            for p_id, p_data in tracks["people"].items():
+                p_centroid = get_centroid(p_data["bbox"])
+                distance = np.linalg.norm(np.array(centroid) - np.array(p_centroid))
+                
+                if distance < min_distance and distance < OWNER_DISTANCE_THRESHOLD:
+                    min_distance = distance
+                    new_owner_id = p_id
+            
+            if new_owner_id is not None:
+                # Assign new owner
+                bag_data["owner"] = new_owner_id
+                bag_data["last_owner_seen"] = None
+            else:
+                # No valid owner
+                bag_data["owner"] = None
+                if bag_data["last_owner_seen"] is None:
+                    bag_data["last_owner_seen"] = current_time
 
         # Check abandonment conditions
         abandonment_time = 0
