@@ -32,10 +32,11 @@ person_tracker = DeepSort(max_age=30)
 bag_tracker = DeepSort(max_age=30)
 
 # Constants
+CYAN = (255, 255, 0)  # BGR color format
 CLASS_NAMES = {0: "Human", 24: "Suitcase", 26: "Handbag", 28: "Backpack"}
 ABANDONMENT_TIME_THRESHOLD = 2  # seconds
 STATIONARY_THRESHOLD = 15  # pixels
-OWNER_DISTANCE_RATIO = 0.3  # % of person height
+OWNER_DISTANCE_RATIO = 0.5  # % of person height
 
 # Utility Functions
 def get_centroid(bbox):
@@ -59,7 +60,7 @@ def is_inside(person_bbox, bag_centroid):
 tracks = {"people": {}, "bags": {}}
 
 # Main Processing
-cap = cv2.VideoCapture(vids[2])
+cap = cv2.VideoCapture(vids[4])
 cv2.namedWindow("Smart Baggage Monitoring", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Smart Baggage Monitoring", 1280, 720)
 
@@ -87,31 +88,6 @@ while cap.isOpened():
     person_tracks = person_tracker.update_tracks(person_detections, frame=frame)
     bag_tracks = bag_tracker.update_tracks(bag_detections, frame=frame)
     current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-
-    # Update People Tracks
-    for track in person_tracks:
-        if not track.is_confirmed():
-            continue
-            
-        track_id = track.track_id
-        ltrb = track.to_ltrb()
-        x1, y1, x2, y2 = map(int, ltrb)
-
-        if track_id not in tracks["people"]:
-            tracks["people"][track_id] = {
-                "bbox": ltrb,
-                "last_seen": current_time,
-                "owned_bags": set()
-            }
-        else:
-            tracks["people"][track_id].update({
-                "bbox": ltrb,
-                "last_seen": current_time
-            })
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(frame, f"Human#{track_id}", (x1, y1-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
     # Process Bags
     for track in bag_tracks:
@@ -179,42 +155,85 @@ while cap.isOpened():
         color = (0, 255, 0)
         text = ""
         
-        if bag_data["last_owner_seen"]:
+        if bag_data["owner"] is not None:
+            color = CYAN  # Cyan for owned bags
+        elif bag_data["last_owner_seen"]:
             abandonment_time = current_time - bag_data["last_owner_seen"]
             movement = np.linalg.norm(np.array(bag_centroid) - np.array(bag_data["last_position"]))
             
             if abandonment_time > ABANDONMENT_TIME_THRESHOLD and movement < STATIONARY_THRESHOLD:
-                color = (0, 0, 255)
+                color = (0, 0, 255)  # Red for abandoned
                 text = f"ABANDONED! {abandonment_time:.1f}s"
+            else:
+                color = (0, 255, 0)  # Green for unowned but not abandoned
+        else:
+            color = (0, 255, 0)  # Green default
 
-        # Draw Elements
+        # Draw Elements (keep connection line the same)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, f"{class_name}#{track_id}", (x1, y1-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
             owner_bbox = tracks["people"][bag_data["owner"]]["bbox"]
             ox1, oy1, ox2, oy2 = map(int, owner_bbox)
             owner_centroid = get_centroid(owner_bbox)
             
-            cv2.line(frame, bag_centroid, owner_centroid, (255, 255, 0), 2)
-            cv2.putText(frame, f"Owner#{bag_data['owner']}", (ox1, oy1-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            # Keep connection line cyan
+            cv2.line(frame, bag_centroid, owner_centroid, CYAN, 2)
+
         
         if text:
             cv2.putText(frame, text, (x1, y1-40), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         # Update Tracking
         bag_data["last_position"] = bag_centroid
         bag_data["last_seen"] = current_time
 
+
+        # Update People Tracks
+    
+    for track in person_tracks:
+        if not track.is_confirmed():
+            continue
+            
+        track_id = track.track_id
+        ltrb = track.to_ltrb()
+        x1, y1, x2, y2 = map(int, ltrb)
+
+        if track_id not in tracks["people"]:
+            tracks["people"][track_id] = {
+                "bbox": ltrb,
+                "last_seen": current_time,
+                "owned_bags": set()
+            }
+        else:
+            tracks["people"][track_id].update({
+                "bbox": ltrb,
+                "last_seen": current_time
+            })
+        
+        person_color = CYAN if tracks["people"][track_id]["owned_bags"] else (255, 0, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), person_color, 2)
+        cv2.putText(frame, f"Human#{track_id}", (x1, y1-10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, person_color, 2)
+
     # Cleanup Old Tracks
+    # First process bags to maintain valid ownership references
+    current_bag_ids = {t.track_id for t in bag_tracks if t.is_confirmed()}
+
+    # Remove any bag ownership references for disappeared bags
+    for person_id in list(tracks["people"].keys()):
+        # Create new set with only currently tracked bags
+        valid_owned = {bid for bid in tracks["people"][person_id]["owned_bags"] if bid in current_bag_ids}
+        tracks["people"][person_id]["owned_bags"] = valid_owned
+
+    # Now cleanup old tracks
     for track_type in ["people", "bags"]:
         for t_id in list(tracks[track_type].keys()):
             if current_time - tracks[track_type][t_id].get("last_seen", current_time) > 30:
                 del tracks[track_type][t_id]
-
     # Display
     frame = cv2.resize(frame, None, fx=0.5, fy=0.5)
     cv2.imshow("Smart Baggage Monitoring", frame)
