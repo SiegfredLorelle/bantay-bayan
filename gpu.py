@@ -11,36 +11,6 @@ import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
-# Initialize YOLOv8 model
-model = YOLO("yolov8l.pt")
-
-# Initialize DeepSORT trackers
-person_tracker = DeepSort(max_age=30)
-bag_tracker = DeepSort(max_age=30)
-
-# COCO class IDs and names
-CLASS_NAMES = {
-    0: "Human",
-    24: "Suitcase",
-    26: "Handbag",
-    28: "Backpack"
-}
-
-# Track history storage
-tracks = {
-    "people": {},
-    "bags": {}
-}
-
-# Thresholds
-OWNER_DISTANCE_THRESHOLD = 250  # pixels
-ABANDONMENT_TIME_THRESHOLD = 2  # seconds after owner leaves
-STATIONARY_THRESHOLD = 15  # pixels movement
-
-def get_centroid(bbox):
-    x1, y1, x2, y2 = bbox
-    return (int((x1 + x2) // 2), int((y1 + y2) // 2))
-
 
 vids = [
     # GOODS
@@ -55,8 +25,41 @@ vids = [
     "C:/Users/Siegfred/programs/bantay-bayan/vids/test-vid-3.mkv",
     
 ]
-cap = cv2.VideoCapture(vids[1])
 
+# Initialize Models
+model = YOLO("yolov8l.pt")
+person_tracker = DeepSort(max_age=30)
+bag_tracker = DeepSort(max_age=30)
+
+# Constants
+CLASS_NAMES = {0: "Human", 24: "Suitcase", 26: "Handbag", 28: "Backpack"}
+ABANDONMENT_TIME_THRESHOLD = 2  # seconds
+STATIONARY_THRESHOLD = 15  # pixels
+OWNER_DISTANCE_RATIO = 0.3  # % of person height
+
+# Utility Functions
+def get_centroid(bbox):
+    x1, y1, x2, y2 = bbox
+    return (int((x1 + x2) // 2), int((y1 + y2) // 2))
+
+def get_bottom_center(bbox):
+    x1, y1, x2, y2 = bbox
+    return (int((x1 + x2) // 2), int(y2))
+
+def calculate_person_size(bbox):
+    x1, y1, x2, y2 = bbox
+    return (y2 - y1, x2 - x1)
+
+def is_inside(person_bbox, bag_centroid):
+    x1, y1, x2, y2 = person_bbox
+    bx, by = bag_centroid
+    return x1 <= bx <= x2 and y1 <= by <= y2
+
+# Track Storage
+tracks = {"people": {}, "bags": {}}
+
+# Main Processing
+cap = cv2.VideoCapture(vids[2])
 cv2.namedWindow("Smart Baggage Monitoring", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Smart Baggage Monitoring", 1280, 720)
 
@@ -65,13 +68,13 @@ while cap.isOpened():
     if not ret:
         break
 
-    # Detect people and bags
+    # Detection
     results = model.predict(frame, classes=[0, 24, 26, 28], conf=0.5)
     boxes = results[0].boxes.xyxy.cpu().numpy()
     confidences = results[0].boxes.conf.cpu().numpy()
     class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
 
-    # Separate detections
+    # Separate Detections
     person_detections = []
     bag_detections = []
     for (x1, y1, x2, y2), conf, cls_id in zip(boxes, confidences, class_ids):
@@ -80,31 +83,37 @@ while cap.isOpened():
         else:
             bag_detections.append(([x1, y1, x2-x1, y2-y1], conf, cls_id))
 
-    # Update trackers
+    # Tracking
     person_tracks = person_tracker.update_tracks(person_detections, frame=frame)
     bag_tracks = bag_tracker.update_tracks(bag_detections, frame=frame)
     current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
 
-    # Update people tracks AND DRAW THEM
+    # Update People Tracks
     for track in person_tracks:
         if not track.is_confirmed():
             continue
+            
         track_id = track.track_id
         ltrb = track.to_ltrb()
-        
-        # Store in tracks dict
-        tracks["people"][track_id] = {
-            "bbox": ltrb,
-            "last_seen": current_time
-        }
-
-        # Draw person bounding box (ADDED THIS SECTION)
         x1, y1, x2, y2 = map(int, ltrb)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue box
+
+        if track_id not in tracks["people"]:
+            tracks["people"][track_id] = {
+                "bbox": ltrb,
+                "last_seen": current_time,
+                "owned_bags": set()
+            }
+        else:
+            tracks["people"][track_id].update({
+                "bbox": ltrb,
+                "last_seen": current_time
+            })
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
         cv2.putText(frame, f"Human#{track_id}", (x1, y1-10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-    # Process bags
+    # Process Bags
     for track in bag_tracks:
         if not track.is_confirmed():
             continue
@@ -112,106 +121,102 @@ while cap.isOpened():
         track_id = track.track_id
         ltrb = track.to_ltrb()
         x1, y1, x2, y2 = map(int, ltrb)
-        centroid = get_centroid(ltrb)
+        bag_centroid = get_centroid(ltrb)
 
-        # Initialize bag track
+        # Initialize Bag Track
         if track_id not in tracks["bags"]:
             tracks["bags"][track_id] = {
                 "class_id": next((det[2] for det in bag_detections 
-                                if get_centroid(det[0]) == centroid), 24),
+                                if get_centroid([det[0][0], det[0][1], 
+                                               det[0][0]+det[0][2], 
+                                               det[0][1]+det[0][3]]) == bag_centroid), 24),
                 "owner": None,
                 "last_owner_seen": None,
                 "stationary_since": current_time,
-                "last_position": centroid
+                "last_position": bag_centroid,
+                "last_seen": current_time
             }
 
         bag_data = tracks["bags"][track_id]
         class_name = CLASS_NAMES.get(bag_data["class_id"], "Bag")
 
-        # Update owner status (NEW LOGIC)
-        current_owner_valid = False
-        if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
-            owner_centroid = get_centroid(tracks["people"][bag_data["owner"]]["bbox"])
-            distance = np.linalg.norm(np.array(centroid) - np.array(owner_centroid))
+        # Owner Association
+        best_owner = None
+        min_distance = float('inf')
+        
+        for p_id, p_data in tracks["people"].items():
+            person_bbox = p_data["bbox"]
+            p_height, _ = calculate_person_size(person_bbox)
             
-            if distance <= OWNER_DISTANCE_THRESHOLD:
-                current_owner_valid = True
-                bag_data["last_owner_seen"] = None
-            else:
-                # Owner is too far
-                current_owner_valid = False
+            bottom_center = get_bottom_center(person_bbox)
+            person_centroid = get_centroid(person_bbox)
+            
+            distance_to_feet = np.linalg.norm(np.array(bag_centroid) - np.array(bottom_center))
+            distance_to_centroid = np.linalg.norm(np.array(bag_centroid) - np.array(person_centroid))
+            current_distance = min(distance_to_feet, distance_to_centroid)
+            
+            if (current_distance < p_height * OWNER_DISTANCE_RATIO or 
+                is_inside(person_bbox, bag_centroid)) and current_distance < min_distance:
+                min_distance = current_distance
+                best_owner = p_id
+
+        # Update Ownership
+        if best_owner is not None:
+            if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
+                tracks["people"][bag_data["owner"]]["owned_bags"].discard(track_id)
+            bag_data["owner"] = best_owner
+            tracks["people"][best_owner]["owned_bags"].add(track_id)
+            bag_data["last_owner_seen"] = None
         else:
-            current_owner_valid = False
+            if bag_data["owner"]:
+                tracks["people"][bag_data["owner"]]["owned_bags"].discard(track_id)
+            bag_data["owner"] = None
+            if bag_data["last_owner_seen"] is None:
+                bag_data["last_owner_seen"] = current_time
 
-        if not current_owner_valid:
-            # Find new owner
-            min_distance = float('inf')
-            new_owner_id = None
-            for p_id, p_data in tracks["people"].items():
-                p_centroid = get_centroid(p_data["bbox"])
-                distance = np.linalg.norm(np.array(centroid) - np.array(p_centroid))
-                
-                if distance < min_distance and distance < OWNER_DISTANCE_THRESHOLD:
-                    min_distance = distance
-                    new_owner_id = p_id
-            
-            if new_owner_id is not None:
-                # Assign new owner
-                bag_data["owner"] = new_owner_id
-                bag_data["last_owner_seen"] = None
-            else:
-                # No valid owner
-                bag_data["owner"] = None
-                if bag_data["last_owner_seen"] is None:
-                    bag_data["last_owner_seen"] = current_time
-
-        # Check abandonment conditions
+        # Abandonment Check
         abandonment_time = 0
-        color = (0, 255, 0)  # Green
+        color = (0, 255, 0)
         text = ""
         
         if bag_data["last_owner_seen"]:
             abandonment_time = current_time - bag_data["last_owner_seen"]
-            movement = np.linalg.norm(np.array(centroid) - np.array(bag_data["last_position"]))
+            movement = np.linalg.norm(np.array(bag_centroid) - np.array(bag_data["last_position"]))
             
             if abandonment_time > ABANDONMENT_TIME_THRESHOLD and movement < STATIONARY_THRESHOLD:
-                color = (0, 0, 255)  # Red
+                color = (0, 0, 255)
                 text = f"ABANDONED! {abandonment_time:.1f}s"
 
-        # Draw elements
+        # Draw Elements
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, f"{class_name}#{track_id}", (x1, y1-10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
-            # Draw owner connection line
             owner_bbox = tracks["people"][bag_data["owner"]]["bbox"]
             ox1, oy1, ox2, oy2 = map(int, owner_bbox)
-            
-            # Get integer centroids
-            bag_centroid = (int(centroid[0]), int(centroid[1]))  # Already calculated as integers
             owner_centroid = get_centroid(owner_bbox)
             
             cv2.line(frame, bag_centroid, owner_centroid, (255, 255, 0), 2)
-            cv2.putText(frame, f"Owner#{bag_data['owner']}", 
-                    (ox1, oy1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(frame, f"Owner#{bag_data['owner']}", (ox1, oy1-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         
         if text:
             cv2.putText(frame, text, (x1, y1-40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # Update position history
-        bag_data["last_position"] = centroid
+        # Update Tracking
+        bag_data["last_position"] = bag_centroid
+        bag_data["last_seen"] = current_time
 
-    # Cleanup old tracks
+    # Cleanup Old Tracks
     for track_type in ["people", "bags"]:
         for t_id in list(tracks[track_type].keys()):
             if current_time - tracks[track_type][t_id].get("last_seen", current_time) > 30:
                 del tracks[track_type][t_id]
 
-
-    frame = cv2.resize(frame, None, fx=0.5, fy=0.5)  # Scale down
-
+    # Display
+    frame = cv2.resize(frame, None, fx=0.5, fy=0.5)
     cv2.imshow("Smart Baggage Monitoring", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
