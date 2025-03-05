@@ -26,17 +26,28 @@ vids = [
     
 ]
 
+# Constants
+STATUS_COLORS = {
+    "owned": (255, 255, 0),  # Cyan
+    "safe": (0, 255, 0),     # Green
+    "warning": (0, 255, 255),# Yellow
+    "abandoned": (0, 0, 255) # Red
+}
+CLASS_NAMES = {0: "Human", 24: "Suitcase", 26: "Handbag", 28: "Backpack"}
+THRESHOLDS = {
+    "stationary": 15,          # Pixels movement
+    "owner_distance_ratio": 0.5,  # % of person height
+    "abandonment": {           # Seconds
+        "green_max": 2,
+        "yellow_max": 10,
+        "red": 10
+    }
+}
+
 # Initialize Models
 model = YOLO("yolov8l.pt")
 person_tracker = DeepSort(max_age=30)
 bag_tracker = DeepSort(max_age=30)
-
-# Constants
-CYAN = (255, 255, 0)  # BGR color format
-CLASS_NAMES = {0: "Human", 24: "Suitcase", 26: "Handbag", 28: "Backpack"}
-ABANDONMENT_TIME_THRESHOLD = 2  # seconds
-STATIONARY_THRESHOLD = 15  # pixels
-OWNER_DISTANCE_RATIO = 0.5  # % of person height
 
 # Utility Functions
 def get_centroid(bbox):
@@ -60,7 +71,7 @@ def is_inside(person_bbox, bag_centroid):
 tracks = {"people": {}, "bags": {}}
 
 # Main Processing
-cap = cv2.VideoCapture(vids[4])
+cap = cv2.VideoCapture(vids[1])
 cv2.namedWindow("Smart Baggage Monitoring", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Smart Baggage Monitoring", 1280, 720)
 
@@ -75,7 +86,7 @@ while cap.isOpened():
     confidences = results[0].boxes.conf.cpu().numpy()
     class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
 
-    # Separate Detections
+    # Separate detections
     person_detections = []
     bag_detections = []
     for (x1, y1, x2, y2), conf, cls_id in zip(boxes, confidences, class_ids):
@@ -89,7 +100,7 @@ while cap.isOpened():
     bag_tracks = bag_tracker.update_tracks(bag_detections, frame=frame)
     current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
 
-    # Process Bags
+    # Process Bags First
     for track in bag_tracks:
         if not track.is_confirmed():
             continue
@@ -131,7 +142,7 @@ while cap.isOpened():
             distance_to_centroid = np.linalg.norm(np.array(bag_centroid) - np.array(person_centroid))
             current_distance = min(distance_to_feet, distance_to_centroid)
             
-            if (current_distance < p_height * OWNER_DISTANCE_RATIO or 
+            if (current_distance < p_height * THRESHOLDS["owner_distance_ratio"] or 
                 is_inside(person_bbox, bag_centroid)) and current_distance < min_distance:
                 min_distance = current_distance
                 best_owner = p_id
@@ -150,50 +161,63 @@ while cap.isOpened():
             if bag_data["last_owner_seen"] is None:
                 bag_data["last_owner_seen"] = current_time
 
-        # Abandonment Check
+        # Abandonment Status System
         abandonment_time = 0
-        color = (0, 255, 0)
+        color = STATUS_COLORS["safe"]
         text = ""
+        progress = 0
         
         if bag_data["owner"] is not None:
-            color = CYAN  # Cyan for owned bags
+            color = STATUS_COLORS["owned"]
         elif bag_data["last_owner_seen"]:
             abandonment_time = current_time - bag_data["last_owner_seen"]
             movement = np.linalg.norm(np.array(bag_centroid) - np.array(bag_data["last_position"]))
             
-            if abandonment_time > ABANDONMENT_TIME_THRESHOLD and movement < STATIONARY_THRESHOLD:
-                color = (0, 0, 255)  # Red for abandoned
-                text = f"ABANDONED! {abandonment_time:.1f}s"
+            if movement < THRESHOLDS["stationary"]:
+                if abandonment_time > THRESHOLDS["abandonment"]["red"]:
+                    color = STATUS_COLORS["abandoned"]
+                    text = f"ABANDONED! {abandonment_time:.1f}s"
+                    progress = 1.0
+                elif abandonment_time > THRESHOLDS["abandonment"]["green_max"]:
+                    color = STATUS_COLORS["warning"]
+                    text = f"WARNING! {abandonment_time:.1f}s"
+                    progress = (abandonment_time - THRESHOLDS["abandonment"]["green_max"]) / \
+                              (THRESHOLDS["abandonment"]["red"] - THRESHOLDS["abandonment"]["green_max"])
+                else:
+                    color = STATUS_COLORS["safe"]
+                    progress = abandonment_time / THRESHOLDS["abandonment"]["green_max"]
             else:
-                color = (0, 255, 0)  # Green for unowned but not abandoned
-        else:
-            color = (0, 255, 0)  # Green default
+                bag_data["last_owner_seen"] = None
+                bag_data["last_position"] = bag_centroid
+                progress = 0
 
-        # Draw Elements (keep connection line the same)
+        # Visualization
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, f"{class_name}#{track_id}", (x1, y1-10), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
+        # Progress bar
+        if progress > 0:
+            cv2.rectangle(frame, 
+                        (x1, y2 + 5), 
+                        (int(x1 + (x2-x1) * progress), y2 + 10),
+                        color, -1)
+        
+        if text:
+            cv2.putText(frame, text, (x1, y1-40), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
         if bag_data["owner"] and bag_data["owner"] in tracks["people"]:
             owner_bbox = tracks["people"][bag_data["owner"]]["bbox"]
             ox1, oy1, ox2, oy2 = map(int, owner_bbox)
             owner_centroid = get_centroid(owner_bbox)
-            
-            # Keep connection line cyan
-            cv2.line(frame, bag_centroid, owner_centroid, CYAN, 2)
+            cv2.line(frame, bag_centroid, owner_centroid, STATUS_COLORS["owned"], 2)
 
-        
-        if text:
-            cv2.putText(frame, text, (x1, y1-40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        # Update Tracking
+        # Update tracking data
         bag_data["last_position"] = bag_centroid
         bag_data["last_seen"] = current_time
 
-
-        # Update People Tracks
-    
+    # Process People
     for track in person_tracks:
         if not track.is_confirmed():
             continue
@@ -214,28 +238,24 @@ while cap.isOpened():
                 "last_seen": current_time
             })
         
-        person_color = CYAN if tracks["people"][track_id]["owned_bags"] else (255, 0, 0)
+        person_color = STATUS_COLORS["owned"] if tracks["people"][track_id]["owned_bags"] else (255, 0, 0)
         cv2.rectangle(frame, (x1, y1), (x2, y2), person_color, 2)
         cv2.putText(frame, f"Human#{track_id}", (x1, y1-10), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, person_color, 2)
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, person_color, 2)
 
-    # Cleanup Old Tracks
-    # First process bags to maintain valid ownership references
+    # Cleanup old tracks
     current_bag_ids = {t.track_id for t in bag_tracks if t.is_confirmed()}
-
-    # Remove any bag ownership references for disappeared bags
     for person_id in list(tracks["people"].keys()):
-        # Create new set with only currently tracked bags
         valid_owned = {bid for bid in tracks["people"][person_id]["owned_bags"] if bid in current_bag_ids}
         tracks["people"][person_id]["owned_bags"] = valid_owned
 
-    # Now cleanup old tracks
     for track_type in ["people", "bags"]:
         for t_id in list(tracks[track_type].keys()):
             if current_time - tracks[track_type][t_id].get("last_seen", current_time) > 30:
                 del tracks[track_type][t_id]
+
     # Display
-    frame = cv2.resize(frame, None, fx=0.5, fy=0.5)
+    frame = cv2.resize(frame, None, fx=0.7, fy=0.7)
     cv2.imshow("Smart Baggage Monitoring", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
