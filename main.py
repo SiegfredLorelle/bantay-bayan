@@ -50,7 +50,7 @@ vids = [
 cap = cv2.VideoCapture(vids[5])
 
 cv2.namedWindow("Smart Baggage Monitoring", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Smart Baggage Monitoring", 1280, 720)  # Initial size
+cv2.resizeWindow("Smart Baggage Monitoring", 1280, 720)
 
 while cap.isOpened():
     ret, frame = cap.read()

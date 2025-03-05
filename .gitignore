@@ -1,2 +1,4 @@
 venv
 *.pt
+__pycache__
+vids
