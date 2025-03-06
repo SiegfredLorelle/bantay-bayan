@@ -2,3 +2,4 @@ ultralytics
 deep-sort-realtime
 opencv-python
 numpy
+streamlit
